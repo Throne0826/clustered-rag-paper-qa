@@ -2,8 +2,6 @@
 *.pyc
 .env
 .cursor/
-.idea/
-*.zip
 
 chunks.jsonl
 chunks_with_emb.jsonl
