@@ -13,3 +13,5 @@ cluster_metadata.json
 cluster_labels.json
 
 papers_by_category/**/*.pdf
+
+.idea/
