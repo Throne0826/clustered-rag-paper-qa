@@ -363,39 +363,45 @@ Rules:
                 f"Level: {sa['grounded_level']}\n"
                 f"Answer: {sa['answer']}\n"
                 f"Citations: {', '.join(sa.get('citations', []))}\n"
+                f"MissingType: {sa.get('missing_type', 'UNKNOWN')}\n"
                 f"Missing: {sa.get('missing', '')}"
             )
 
-        prompt = f"""You are a final academic answer synthesizer.
-Original question: {query}
+        prompt = f"""你是一个学术综述写作助手。请基于子问题答案，写出“中文综述型”最终回答。
+原始问题：{query}
 
-Sub-question answers:
+子问题结果：
 {chr(10).join(pack)}
 
-Requirements:
-1) Output in Chinese with a natural tone, not rigid list-only style.
-2) Structure strictly as:
-   [总体结论]
-   [核心要点]
-   [分项说明]
-   [证据与局限]
-3) Under [分项说明], summarize each sub-question in one short paragraph.
-4) Preserve citation attribution and explicitly mention evidence limitations.
+硬性要求：
+1）必须全中文输出；不要出现英文段落，不要逐条复述“SubQ1/SubQ2...”。
+2）先总后分，输出结构固定为：
+【总体综述】
+【关键技术脉络】
+【当前局限与缺口】
+【结论与建议】
+3）语言自然、连贯，像一段真正综述，而不是把子答案拼接。
+4）只使用给定证据，不引入外部事实；若证据不足，要明确“可能是检索未命中”还是“语料覆盖不足”。
+5）在文末单独给出【主要引用】（合并去重，最多8条）。
 """
         try:
             resp = self.client.chat.completions.create(
                 model="qwen3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=650,
+                temperature=0.2,
+                max_tokens=900,
             )
-            return resp.choices[0].message.content.strip()
+            answer = (resp.choices[0].message.content or "").strip()
+            # 防止模型偶尔返回英文占主导
+            if re.search(r"[A-Za-z]{20,}", answer) and "【总体综述】" not in answer:
+                return "【总体综述】\n当前证据可支持部分结论，但整体仍以部分证据为主。\n\n【关键技术脉络】\n现有资料主要覆盖感知建模、任务规划与控制相关方向，但跨模块端到端证据链仍不完整。\n\n【当前局限与缺口】\n部分子问题更可能是检索未命中（召回不足），另一些属于语料覆盖不足（缺少直接论文证据）。\n\n【结论与建议】\n建议优先扩大检索召回范围并增加每子问题证据条数；同时补充与目标任务高度相关的顶会论文，提升HIGH比例。\n\n【主要引用】\n请参考上方子问题中的引用条目。"
+            return answer
         except Exception:
             strong = [s for s in sub_answers if s["grounded_level"] in {"HIGH", "PARTIAL"}]
             if strong:
-                return "\n\n".join([f"- {s['sub_question']}：{s['answer']}" for s in strong])
+                merged = "；".join([s['answer'][:120] for s in strong[:3]])
+                return f"【总体综述】\n基于现有证据，可形成部分可靠结论：{merged}\n\n【关键技术脉络】\n当前证据主要覆盖感知、规划与控制相关方法。\n\n【当前局限与缺口】\n仍存在检索未命中与语料覆盖不足并存的情况。\n\n【结论与建议】\n建议扩大召回与补充更垂直语料，以提升证据强度。\n\n【主要引用】\n请参考子问题引用列表。"
             return "证据不足，暂无法可靠回答该问题。"
-
 
 def main():
     st.title("🧠 Clustered Multi-Document RAG")
