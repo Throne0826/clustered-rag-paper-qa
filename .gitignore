@@ -1,0 +1,15 @@
+﻿__pycache__/
+*.pyc
+.env
+.cursor/
+
+chunks.jsonl
+chunks_with_emb.jsonl
+chunks_clustered.jsonl
+faiss_index.bin
+id_to_chunk.pkl
+metadata.pkl
+cluster_metadata.json
+cluster_labels.json
+
+papers_by_category/**/*.pdf
