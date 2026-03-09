@@ -5,6 +5,7 @@ import pickle
 import re
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import faiss
 import numpy as np
@@ -191,6 +192,7 @@ Return strict JSON:
         retrieve_k: int = 40,
         retrieve_candidate_k: int = 220,
         retrieve_max_per_cluster: int = 8,
+        top_cluster_limit: int = 4,
     ):
         chunks = self.retrieve(
             subq,
@@ -214,7 +216,7 @@ Return strict JSON:
         scored.sort(key=lambda x: x[2], reverse=True)
 
         evidence = []
-        for cid, docs, _ in scored[:4]:
+        for cid, docs, _ in scored[:top_cluster_limit]:
             for d in docs[:per_cluster_docs]:
                 d["cluster_label"] = self.cluster_labels.get(cid, f"Cluster_{cid}")
                 evidence.append(d)
@@ -288,6 +290,71 @@ Rules:
                 "missing": "解析LLM输出失败"
             }
 
+    def diagnose_missing_type(self, sub_answer: dict, cluster_count: int, evidence_count: int):
+        """区分缺失更可能是语料不足还是检索未命中。"""
+        level = sub_answer.get("grounded_level", "LOW")
+        if level == "HIGH":
+            return "NONE"
+        if evidence_count <= 2 and cluster_count <= 1:
+            return "RETRIEVAL_MISS"
+        if evidence_count >= 6 and cluster_count >= 3:
+            return "INSUFFICIENT_CORPUS"
+        missing = (sub_answer.get("missing", "") or "").lower()
+        miss_keywords = ["未检索", "不相关", "not contain", "not relevant", "no information"]
+        if any(k in missing for k in miss_keywords):
+            return "RETRIEVAL_MISS"
+        return "INSUFFICIENT_CORPUS"
+
+    def process_one_subquery(
+        self,
+        subq: str,
+        per_cluster_docs: int,
+        max_docs: int,
+        retrieve_k: int,
+        retrieve_candidate_k: int,
+        retrieve_max_per_cluster: int,
+        top_cluster_limit: int,
+        enable_second_pass: bool,
+    ):
+        evidence, cluster_cnt = self.route_evidence_for_subquery(
+            subq,
+            per_cluster_docs=per_cluster_docs,
+            max_docs=max_docs,
+            retrieve_k=retrieve_k,
+            retrieve_candidate_k=retrieve_candidate_k,
+            retrieve_max_per_cluster=retrieve_max_per_cluster,
+            top_cluster_limit=top_cluster_limit,
+        )
+
+        sa = self.answer_subquery(subq, evidence)
+        missing_type = self.diagnose_missing_type(sa, cluster_cnt, len(evidence))
+
+        second_pass_used = False
+        if enable_second_pass and sa.get("grounded_level") == "LOW":
+            expanded_evidence, expanded_cluster_cnt = self.route_evidence_for_subquery(
+                subq,
+                per_cluster_docs=min(per_cluster_docs + 1, 4),
+                max_docs=min(max_docs + 4, 16),
+                retrieve_k=min(retrieve_k + 30, 150),
+                retrieve_candidate_k=min(retrieve_candidate_k + 120, 600),
+                retrieve_max_per_cluster=min(retrieve_max_per_cluster + 4, 20),
+                top_cluster_limit=min(top_cluster_limit + 2, 8),
+            )
+            if len(expanded_evidence) > len(evidence):
+                second_sa = self.answer_subquery(subq, expanded_evidence)
+                if second_sa.get("grounded_level") in {"HIGH", "PARTIAL"}:
+                    sa = second_sa
+                    evidence = expanded_evidence
+                    cluster_cnt = expanded_cluster_cnt
+                    second_pass_used = True
+                    missing_type = self.diagnose_missing_type(sa, cluster_cnt, len(evidence))
+
+        sa["evidence_count"] = len(evidence)
+        sa["cluster_count"] = cluster_cnt
+        sa["missing_type"] = missing_type
+        sa["second_pass_used"] = second_pass_used
+        return sa
+
     def synthesize_final(self, query: str, sub_answers):
         pack = []
         for i, sa in enumerate(sub_answers, 1):
@@ -306,9 +373,14 @@ Sub-question answers:
 {chr(10).join(pack)}
 
 Requirements:
-1) Synthesize a concise final answer in Chinese.
-2) Preserve citation attribution by sub-question evidence.
-3) If evidence is insufficient in key parts, explicitly mention limitations.
+1) Output in Chinese with a natural tone, not rigid list-only style.
+2) Structure strictly as:
+   [总体结论]
+   [核心要点]
+   [分项说明]
+   [证据与局限]
+3) Under [分项说明], summarize each sub-question in one short paragraph.
+4) Preserve citation attribution and explicitly mention evidence limitations.
 """
         try:
             resp = self.client.chat.completions.create(
@@ -337,6 +409,9 @@ def main():
     retrieve_k = st.sidebar.slider("每子问题检索k", 20, 100, 40, step=10)
     retrieve_candidate_k = st.sidebar.slider("每子问题候选召回", retrieve_k, 400, 220, step=20)
     retrieve_max_per_cluster = st.sidebar.slider("检索阶段每簇上限", 2, 20, 8)
+    top_cluster_limit = st.sidebar.slider("子问题路由簇数上限", 2, 8, 4)
+    max_workers = st.sidebar.slider("子问题并发数", 1, 8, 4)
+    enable_second_pass = st.sidebar.checkbox("低置信子问题启用二次检索回补", value=True)
     refusal_threshold = st.sidebar.slider("拒答阈值(证据置信度低于该值拒答)", 0.0, 1.0, 0.25, step=0.05)
 
     with st.spinner("🚀 正在加载模型（首次较慢）..."):
@@ -366,6 +441,9 @@ def main():
             retrieve_k=retrieve_k,
             retrieve_candidate_k=retrieve_candidate_k,
             retrieve_max_per_cluster=retrieve_max_per_cluster,
+            top_cluster_limit=top_cluster_limit,
+            max_workers=max_workers,
+            enable_second_pass=enable_second_pass,
             refusal_threshold=refusal_threshold,
         )
 
@@ -380,6 +458,9 @@ def process_query(
     retrieve_k: int = 40,
     retrieve_candidate_k: int = 220,
     retrieve_max_per_cluster: int = 8,
+    top_cluster_limit: int = 4,
+    max_workers: int = 4,
+    enable_second_pass: bool = True,
     refusal_threshold: float = 0.25,
 ):
     t0 = time.time()
@@ -392,27 +473,56 @@ def process_query(
         status.update(label="✅ 拆解完成", state="complete")
 
     sub_answers = []
-    with st.status("📚 Step 2-3: 子问题证据路由与回答", expanded=True) as status:
-        for i, sq in enumerate(subqs, 1):
-            evidence, cluster_cnt = rag.route_evidence_for_subquery(
-                sq,
-                per_cluster_docs=per_cluster_docs,
-                max_docs=max_docs,
-                retrieve_k=retrieve_k,
-                retrieve_candidate_k=retrieve_candidate_k,
-                retrieve_max_per_cluster=retrieve_max_per_cluster,
-            )
-            sa = rag.answer_subquery(sq, evidence)
-            sa["evidence_count"] = len(evidence)
-            sa["cluster_count"] = cluster_cnt
+    with st.status("📚 Step 2-3: 子问题证据路由与回答（并发）", expanded=True) as status:
+        results_by_idx = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    rag.process_one_subquery,
+                    sq,
+                    per_cluster_docs,
+                    max_docs,
+                    retrieve_k,
+                    retrieve_candidate_k,
+                    retrieve_max_per_cluster,
+                    top_cluster_limit,
+                    enable_second_pass,
+                ): i
+                for i, sq in enumerate(subqs, 1)
+            }
+
+            for future in as_completed(futures):
+                i = futures[future]
+                sq = subqs[i - 1]
+                try:
+                    results_by_idx[i] = future.result()
+                except Exception as e:
+                    results_by_idx[i] = {
+                        "sub_question": sq,
+                        "grounded_level": "LOW",
+                        "answer": "子问题处理失败。",
+                        "citations": [],
+                        "missing": str(e)[:180],
+                        "evidence_count": 0,
+                        "cluster_count": 0,
+                        "missing_type": "RETRIEVAL_MISS",
+                        "second_pass_used": False,
+                    }
+
+        for i in range(1, len(subqs) + 1):
+            sa = results_by_idx[i]
             sub_answers.append(sa)
+            missing_type = sa.get("missing_type", "UNKNOWN")
+            miss_text = "检索未命中/召回不足" if missing_type == "RETRIEVAL_MISS" else "语料覆盖不足"
+            second_pass_note = " | 二次检索: 已触发" if sa.get("second_pass_used") else ""
 
             st.markdown(f"""
             <div class='answer-box'>
-              <b>SubQ{i}</b>: {sq}<br>
-              Grounded: <b>{sa['grounded_level']}</b> | Evidence: {len(evidence)} docs | Clusters: {cluster_cnt}<br><br>
+              <b>SubQ{i}</b>: {sa['sub_question']}<br>
+              Grounded: <b>{sa['grounded_level']}</b> | Evidence: {sa.get('evidence_count', 0)} docs | Clusters: {sa.get('cluster_count', 0)}{second_pass_note}<br><br>
               <b>回答</b>: {sa['answer']}<br>
               <b>引用</b>: {', '.join(sa.get('citations', [])[:4]) if sa.get('citations') else '无'}<br>
+              <b>缺失类型</b>: {miss_text}<br>
               <b>缺失</b>: {sa.get('missing', 'None')}
             </div>
             """, unsafe_allow_html=True)
@@ -425,10 +535,13 @@ def process_query(
     conf = (high + 0.5 * partial) / max(len(sub_answers), 1)
 
     with st.spinner("🎯 Step 4: 按子问题引用合成最终答案..."):
+        retrieval_miss_count = sum(1 for s in sub_answers if s.get("missing_type") == "RETRIEVAL_MISS")
         if conf < refusal_threshold:
-            final_answer = "证据不足，暂无法可靠回答该问题。\n\n可尝试：扩大检索k、增加每子问题证据数、补充更匹配的论文语料。"
+            final_answer = "证据不足，暂无法可靠回答该问题。\n\n可尝试：扩大检索k、增加每子问题证据数、提高路由簇数上限、启用二次检索回补。"
         else:
             final_answer = rag.synthesize_final(query, sub_answers)
+            if retrieval_miss_count > 0:
+                final_answer += f"\n\n[说明] 本次有 {retrieval_miss_count} 个子问题更可能属于检索未命中，而非语料绝对缺失。"
 
     st.subheader("🎯 最终答案（按子问题证据合成）")
     st.markdown(f"""
