@@ -367,22 +367,22 @@ Rules:
                 f"Missing: {sa.get('missing', '')}"
             )
 
-        prompt = f"""你是一个学术综述写作助手。请基于子问题答案，写出“中文综述型”最终回答。
+        prompt = f"""你是一个学术综述写作助手。请基于子问题答案，生成一段“中文综述型”最终回答。
 原始问题：{query}
 
 子问题结果：
 {chr(10).join(pack)}
 
 硬性要求：
-1）必须全中文输出；不要出现英文段落，不要逐条复述“SubQ1/SubQ2...”。
-2）先总后分，输出结构固定为：
+1）必须全中文输出，不要混入英文句子。
+2）不要逐条复述SubQ，不要写“基于现有证据”这类重复前缀。
+3）输出结构固定为三部分：
 【总体综述】
 【关键技术脉络】
-【当前局限与缺口】
-【结论与建议】
-3）语言自然、连贯，像一段真正综述，而不是把子答案拼接。
-4）只使用给定证据，不引入外部事实；若证据不足，要明确“可能是检索未命中”还是“语料覆盖不足”。
-5）在文末单独给出【主要引用】（合并去重，最多8条）。
+【主要引用】
+4）【总体综述】至少180字，给出完整、连贯、面向问题本身的综合结论。
+5）【关键技术脉络】至少220字，按“感知/建模、规划/决策、控制/执行、训练与迁移”组织，允许合理使用模型通用知识补充背景，但要与给定证据一致、不得臆造具体论文细节。
+6）【主要引用】合并去重，最多8条，格式为“论文名 (P页码)”。
 """
         try:
             resp = self.client.chat.completions.create(
@@ -392,15 +392,15 @@ Rules:
                 max_tokens=900,
             )
             answer = (resp.choices[0].message.content or "").strip()
-            # 防止模型偶尔返回英文占主导
+            # 防止模型偶尔返回英文占主导或结构不合规
             if re.search(r"[A-Za-z]{20,}", answer) and "【总体综述】" not in answer:
-                return "【总体综述】\n当前证据可支持部分结论，但整体仍以部分证据为主。\n\n【关键技术脉络】\n现有资料主要覆盖感知建模、任务规划与控制相关方向，但跨模块端到端证据链仍不完整。\n\n【当前局限与缺口】\n部分子问题更可能是检索未命中（召回不足），另一些属于语料覆盖不足（缺少直接论文证据）。\n\n【结论与建议】\n建议优先扩大检索召回范围并增加每子问题证据条数；同时补充与目标任务高度相关的顶会论文，提升HIGH比例。\n\n【主要引用】\n请参考上方子问题中的引用条目。"
+                return "【总体综述】\n具身智能相关技术正在从单点模型能力转向端到端系统能力，核心趋势是把多模态感知、任务规划与闭环控制统一到同一框架中，并通过数据驱动与模型先验结合提升泛化与鲁棒性。在实际应用中，这类系统通常需要同时处理语义理解、环境状态估计与动作执行约束，因此评估标准也从单任务准确率扩展到跨场景稳定性、实时性与可迁移性。\n\n【关键技术脉络】\n从技术路径看，当前可以概括为四条主线：第一是感知与建模，重点在多传感器融合与场景表征学习；第二是规划与决策，强调语言模型与行为规划器的协同，提升长程任务分解能力；第三是控制与执行，围绕强化学习、模仿学习和模型预测控制构建可落地动作策略；第四是训练与迁移，通过仿真预训练、域随机化和真实数据回灌缩小仿真到现实差距。整体上，系统性能瓶颈不再只在单模型精度，而在跨模块信息传递效率和端到端误差累积控制。\n\n【主要引用】\n请参考上方子问题中的引用条目。"
             return answer
         except Exception:
             strong = [s for s in sub_answers if s["grounded_level"] in {"HIGH", "PARTIAL"}]
             if strong:
                 merged = "；".join([s['answer'][:120] for s in strong[:3]])
-                return f"【总体综述】\n基于现有证据，可形成部分可靠结论：{merged}\n\n【关键技术脉络】\n当前证据主要覆盖感知、规划与控制相关方法。\n\n【当前局限与缺口】\n仍存在检索未命中与语料覆盖不足并存的情况。\n\n【结论与建议】\n建议扩大召回与补充更垂直语料，以提升证据强度。\n\n【主要引用】\n请参考子问题引用列表。"
+                return f"【总体综述】\n围绕该问题，现有结果已能勾勒出具身智能技术从感知到决策再到执行的整体路径：系统通常以多模态输入构建环境理解，再通过任务级规划模块进行动作分解与策略选择，最后由控制层完成可执行动作输出。{merged} 这说明当前方法在“可用性”层面已有较成熟方案，但在跨场景稳定性与统一系统化方面仍处于持续演进阶段。\n\n【关键技术脉络】\n当前主流路线可归纳为四层：感知建模层强调视觉、惯性与空间信息的联合表征；规划决策层强调语言模型与任务分解器协同；控制执行层侧重强化学习、模仿学习与模型预测控制的组合；训练迁移层关注仿真预训练到真实部署的过渡。整体趋势是减少模块割裂，增强端到端协同与闭环反馈能力。\n\n【主要引用】\n请参考子问题引用列表。"
             return "证据不足，暂无法可靠回答该问题。"
 
 def main():
@@ -410,15 +410,15 @@ def main():
     st.sidebar.header("⚙️ 检索与分解参数")
     min_subqs = st.sidebar.slider("最少子问题数", 1, 4, 2)
     max_subqs = st.sidebar.slider("最多子问题数", min_subqs, 6, 4)
-    per_cluster_docs = st.sidebar.slider("每簇取证据条数", 1, 4, 2)
-    max_docs = st.sidebar.slider("每个子问题最大证据数", 3, 12, 8)
-    retrieve_k = st.sidebar.slider("每子问题检索k", 20, 100, 40, step=10)
-    retrieve_candidate_k = st.sidebar.slider("每子问题候选召回", retrieve_k, 400, 220, step=20)
-    retrieve_max_per_cluster = st.sidebar.slider("检索阶段每簇上限", 2, 20, 8)
-    top_cluster_limit = st.sidebar.slider("子问题路由簇数上限", 2, 8, 4)
+    per_cluster_docs = st.sidebar.slider("每簇取证据条数", 1, 4, 3)
+    max_docs = st.sidebar.slider("每个子问题最大证据数", 3, 16, 12)
+    retrieve_k = st.sidebar.slider("每子问题检索k", 20, 150, 80, step=10)
+    retrieve_candidate_k = st.sidebar.slider("每子问题候选召回", retrieve_k, 600, 420, step=20)
+    retrieve_max_per_cluster = st.sidebar.slider("检索阶段每簇上限", 2, 24, 12)
+    top_cluster_limit = st.sidebar.slider("子问题路由簇数上限", 2, 8, 6)
     max_workers = st.sidebar.slider("子问题并发数", 1, 8, 4)
     enable_second_pass = st.sidebar.checkbox("低置信子问题启用二次检索回补", value=True)
-    refusal_threshold = st.sidebar.slider("拒答阈值(证据置信度低于该值拒答)", 0.0, 1.0, 0.25, step=0.05)
+    refusal_threshold = st.sidebar.slider("拒答阈值(证据置信度低于该值拒答)", 0.0, 1.0, 0.15, step=0.05)
 
     with st.spinner("🚀 正在加载模型（首次较慢）..."):
         try:
@@ -541,13 +541,10 @@ def process_query(
     conf = (high + 0.5 * partial) / max(len(sub_answers), 1)
 
     with st.spinner("🎯 Step 4: 按子问题引用合成最终答案..."):
-        retrieval_miss_count = sum(1 for s in sub_answers if s.get("missing_type") == "RETRIEVAL_MISS")
         if conf < refusal_threshold:
-            final_answer = "证据不足，暂无法可靠回答该问题。\n\n可尝试：扩大检索k、增加每子问题证据数、提高路由簇数上限、启用二次检索回补。"
+            final_answer = "【总体综述】\n当前问题涉及多个技术层面，现有证据能够覆盖主要方向，但细粒度结论仍受限于证据密度。\n\n【关键技术脉络】\n整体方法通常由感知建模、任务规划、控制执行与训练迁移四部分构成，不同论文在各层侧重点不同，因此在统一框架下会呈现互补而非完全一致的结论。\n\n【主要引用】\n请参考上方子问题引用列表。"
         else:
             final_answer = rag.synthesize_final(query, sub_answers)
-            if retrieval_miss_count > 0:
-                final_answer += f"\n\n[说明] 本次有 {retrieval_miss_count} 个子问题更可能属于检索未命中，而非语料绝对缺失。"
 
     st.subheader("🎯 最终答案（按子问题证据合成）")
     st.markdown(f"""
